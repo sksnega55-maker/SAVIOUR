@@ -16,7 +16,7 @@ import {
   INITIAL_RAMAKRISHNAN_DATA, 
   INITIAL_SARAN_DATA 
 } from '../data/mockData';
-import { matchesMonthYear } from '../utils/formatters';
+import { matchesMonthYear, parseSanitizedNumber, parseDateComponents } from '../utils/formatters';
 import { GoogleSheetsService } from './googleSheets';
 
 const CONFIG_STORAGE_KEY = 'saviour_gss_config';
@@ -344,17 +344,190 @@ export class SheetService {
   }
 
   // --- CSV / EXCEL PARSER IMPORT ---
-  public static importTabFromCSV(_tabName: string, csvContent: string): boolean {
+  public static importTabFromCSV(tabName: string, csvContent: string): boolean {
     try {
       const rows = GoogleSheetsService.parseCsvToRows(csvContent);
       if (rows.length < 2) return false;
 
+      const normTab = (tabName || 'sales').toLowerCase().trim();
+
+      if (normTab === 'cash') {
+        const cashRecords: CashRecord[] = [];
+        let hIdx = 0;
+        for (let r = 0; r < Math.min(rows.length, 5); r++) {
+          const l = rows[r].join(' ').toLowerCase();
+          if (l.includes('date') || l.includes('inward') || l.includes('particular')) {
+            hIdx = r;
+            break;
+          }
+        }
+        const headers = rows[hIdx].map(h => h.trim().toLowerCase());
+        const dIdx = headers.findIndex(h => h.includes('date'));
+        const pIdx = headers.findIndex(h => h.includes('particular') || h.includes('desc'));
+        const inIdx = headers.findIndex(h => h.includes('inward') || h.includes('in') || h.includes('receipt'));
+        const outIdx = headers.findIndex(h => h.includes('outward') || h.includes('out') || h.includes('payment'));
+        const balIdx = headers.findIndex(h => h.includes('balance'));
+        const remIdx = headers.findIndex(h => h.includes('remark') || h.includes('note'));
+
+        let runningBal = 0;
+        for (let i = hIdx + 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.length === 0) continue;
+          const rawDate = dIdx !== -1 ? row[dIdx] : '';
+          if (!rawDate) continue;
+          const dComp = parseDateComponents(rawDate);
+          const dateStr = dComp
+            ? `${dComp.year}-${String(dComp.month).padStart(2, '0')}-${String(dComp.day).padStart(2, '0')}`
+            : rawDate;
+
+          const inward = inIdx !== -1 ? parseSanitizedNumber(row[inIdx]) : 0;
+          const outward = outIdx !== -1 ? parseSanitizedNumber(row[outIdx]) : 0;
+          runningBal += (inward - outward);
+          const closingBalance = balIdx !== -1 ? (parseSanitizedNumber(row[balIdx]) || runningBal) : runningBal;
+
+          cashRecords.push({
+            slNo: cashRecords.length + 1,
+            date: dateStr,
+            particulars: (pIdx !== -1 ? row[pIdx] : '') || 'Cash Transaction',
+            inward,
+            outward,
+            closingBalance,
+            remarks: remIdx !== -1 ? row[remIdx] || '' : ''
+          });
+        }
+
+        if (cashRecords.length > 0) {
+          this.cashData = cashRecords;
+          saveToStorage(CASH_STORAGE_KEY, this.cashData);
+          this.updateConfig({ isLive: true, lastSyncedAt: new Date().toISOString() });
+          return true;
+        }
+      }
+
+      if (normTab === 'bank') {
+        const bankRecords: BankRecord[] = [];
+        let hIdx = 0;
+        for (let r = 0; r < Math.min(rows.length, 5); r++) {
+          const l = rows[r].join(' ').toLowerCase();
+          if (l.includes('date') || l.includes('inward') || l.includes('particular')) {
+            hIdx = r;
+            break;
+          }
+        }
+        const headers = rows[hIdx].map(h => h.trim().toLowerCase());
+        const dIdx = headers.findIndex(h => h === 'date' || h.includes('date'));
+        const pIdx = headers.findIndex(h => h.includes('particular') || h.includes('desc'));
+        const invNoIdx = headers.findIndex(h => h.includes('inv no') || h.includes('ref') || h.includes('chq'));
+        const invDateIdx = headers.findIndex(h => h.includes('inv date'));
+        const inIdx = headers.findIndex(h => h.includes('inward') || h.includes('in') || h.includes('deposit') || h.includes('credit'));
+        const outIdx = headers.findIndex(h => h.includes('outward') || h.includes('out') || h.includes('debit'));
+        const balIdx = headers.findIndex(h => h.includes('balance'));
+        const remIdx = headers.findIndex(h => h.includes('remark') || h.includes('note'));
+
+        let runningBal = 0;
+        for (let i = hIdx + 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.length === 0) continue;
+          const rawDate = dIdx !== -1 ? row[dIdx] : '';
+          if (!rawDate) continue;
+          const dComp = parseDateComponents(rawDate);
+          const dateStr = dComp
+            ? `${dComp.year}-${String(dComp.month).padStart(2, '0')}-${String(dComp.day).padStart(2, '0')}`
+            : rawDate;
+
+          const inward = inIdx !== -1 ? parseSanitizedNumber(row[inIdx]) : 0;
+          const outward = outIdx !== -1 ? parseSanitizedNumber(row[outIdx]) : 0;
+          runningBal += (inward - outward);
+          const closingBalance = balIdx !== -1 ? (parseSanitizedNumber(row[balIdx]) || runningBal) : runningBal;
+
+          bankRecords.push({
+            slNo: bankRecords.length + 1,
+            date: dateStr,
+            particulars: (pIdx !== -1 ? row[pIdx] : '') || 'Bank Transaction',
+            invNo: invNoIdx !== -1 ? row[invNoIdx] || '' : `INV-${bankRecords.length + 1}`,
+            invDate: invDateIdx !== -1 ? row[invDateIdx] || dateStr : dateStr,
+            inward,
+            outward,
+            closingBalance,
+            remarks: remIdx !== -1 ? row[remIdx] || '' : ''
+          });
+        }
+
+        if (bankRecords.length > 0) {
+          this.bankData = bankRecords;
+          saveToStorage(BANK_STORAGE_KEY, this.bankData);
+          this.updateConfig({ isLive: true, lastSyncedAt: new Date().toISOString() });
+          return true;
+        }
+      }
+
+      if (normTab === 'ramakrishnan' || normTab === 'saran') {
+        const partnerRecords: PartnerRecord[] = [];
+        let hIdx = 0;
+        for (let r = 0; r < Math.min(rows.length, 5); r++) {
+          const l = rows[r].join(' ').toLowerCase();
+          if (l.includes('date') || l.includes('inward') || l.includes('particular')) {
+            hIdx = r;
+            break;
+          }
+        }
+        const headers = rows[hIdx].map(h => h.trim().toLowerCase());
+        const dIdx = headers.findIndex(h => h.includes('date'));
+        const pIdx = headers.findIndex(h => h.includes('particular') || h.includes('desc'));
+        const inIdx = headers.findIndex(h => h.includes('inward') || h.includes('in') || h.includes('credit'));
+        const outIdx = headers.findIndex(h => h.includes('outward') || h.includes('out') || h.includes('debit'));
+        const balIdx = headers.findIndex(h => h.includes('balance'));
+        const mopIdx = headers.findIndex(h => h.includes('mop') || h.includes('mode'));
+        const remIdx = headers.findIndex(h => h.includes('remark') || h.includes('note'));
+
+        let runningBal = 0;
+        for (let i = hIdx + 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.length === 0) continue;
+          const rawDate = dIdx !== -1 ? row[dIdx] : '';
+          if (!rawDate) continue;
+          const dComp = parseDateComponents(rawDate);
+          const dateStr = dComp
+            ? `${dComp.year}-${String(dComp.month).padStart(2, '0')}-${String(dComp.day).padStart(2, '0')}`
+            : rawDate;
+
+          const inward = inIdx !== -1 ? parseSanitizedNumber(row[inIdx]) : 0;
+          const outward = outIdx !== -1 ? parseSanitizedNumber(row[outIdx]) : 0;
+          runningBal += (inward - outward);
+          const closingBalance = balIdx !== -1 ? (parseSanitizedNumber(row[balIdx]) || runningBal) : runningBal;
+
+          partnerRecords.push({
+            slNo: partnerRecords.length + 1,
+            date: dateStr,
+            particulars: (pIdx !== -1 ? row[pIdx] : '') || 'Partner Ledger Entry',
+            inward,
+            outward,
+            closingBalance,
+            mopMor: mopIdx !== -1 ? row[mopIdx] || 'Bank Transfer' : 'Bank Transfer',
+            remarks: remIdx !== -1 ? row[remIdx] || '' : ''
+          });
+        }
+
+        if (partnerRecords.length > 0) {
+          if (normTab === 'ramakrishnan') {
+            this.ramakrishnanData = partnerRecords;
+            saveToStorage(RAMAKRISHNAN_STORAGE_KEY, this.ramakrishnanData);
+          } else {
+            this.saranData = partnerRecords;
+            saveToStorage(SARAN_STORAGE_KEY, this.saranData);
+          }
+          this.updateConfig({ isLive: true, lastSyncedAt: new Date().toISOString() });
+          return true;
+        }
+      }
+
+      // Default / Sales Tab
       const salesRecords = GoogleSheetsService.mapRowsToSalesRecords(rows);
       if (salesRecords.length > 0) {
         this.salesData = salesRecords;
         saveToStorage(SALES_STORAGE_KEY, this.salesData);
 
-        // Populate Cash Register entries directly from parsed rows
+        // Derive cash entries
         const cashEntries: CashRecord[] = [];
         let cashBal = 25000;
         salesRecords.forEach((s) => {
@@ -383,13 +556,12 @@ export class SheetService {
             });
           }
         });
-
         if (cashEntries.length > 0) {
           this.cashData = cashEntries;
           saveToStorage(CASH_STORAGE_KEY, this.cashData);
         }
 
-        // Populate Bank Register entries directly from parsed rows
+        // Derive bank entries
         const bankEntries: BankRecord[] = [];
         let bankBal = 150000;
         salesRecords.forEach((s, idx) => {
@@ -423,7 +595,6 @@ export class SheetService {
             });
           }
         });
-
         if (bankEntries.length > 0) {
           this.bankData = bankEntries;
           saveToStorage(BANK_STORAGE_KEY, this.bankData);
